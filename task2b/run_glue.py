@@ -45,6 +45,7 @@ from pytorch_transformers import AdamW, WarmupLinearSchedule
 
 from utils_glue import (compute_metrics, convert_examples_to_features,
                         output_modes, processors)
+import torch.distributed as dist
 
 logger = logging.getLogger(__name__)
 
@@ -128,19 +129,73 @@ def train(args, train_dataset, model, tokenizer):
             if args.fp16:
                 with amp.scale_loss(loss, optimizer) as scaled_loss:
                     scaled_loss.backward()
+                # grad_list = []
+                # for param in model.parameters():
+                #     if (param.requires_grad) and (param.grad is not None):
+                #         grad_list.append(param.grad.view(-1))
+                # flatten_grad = torch.cat(grad_list)
+
+                # if dist.get_rank() == 0:
+                #     gather_list = [torch.zeros_like(flatten_grad) for i in range(dist.get_world_size())] 
+                # else:
+                #     gather_list = None
+                # dist.gather(flatten_grad, gather_list, dst=0)
+
+                # if dist.get_rank() == 0:
+                #     grad_mean = torch.stack(gather_list).mean(dim=0)
+                #     scatter_list = [grad_mean for i in range(dist.get_world_size())]
+                # else:
+                #     scatter_list = None
+
+                # avg_grad_received = torch.zeros_like(flatten_grad)
+                # dist.scatter(avg_grad_received, scatter_list, src=0)
+
+                index = 0
+                for param in model.parameters():
+                    if param.requires_grad and (param.grad is not None):
+                        numel = param.grad.numel()
+                        param.grad.copy_(avg_grad_received[index:index + numel].view_as(param.grad))
+                        index += numel
                 torch.nn.utils.clip_grad_norm_(amp.master_params(optimizer), args.max_grad_norm)
             else:
                 ##################################################
                 # TODO(cos568): perform backward pass here (expect one line of code)
-                
+                loss.backward()
                 ##################################################
+                grad_list = []
+                for param in model.parameters():
+                    if (param.requires_grad) and (param.grad is not None):
+                        grad_list.append(param.grad.view(-1))
+                flatten_grad = torch.cat(grad_list)
+
+                if dist.get_rank() == 0:
+                    gather_list = [torch.zeros_like(flatten_grad) for i in range(dist.get_world_size())] 
+                else:
+                    gather_list = None
+                dist.gather(flatten_grad, gather_list, dst=0)
+
+                if dist.get_rank() == 0:
+                    grad_mean = torch.stack(gather_list).mean(dim=0)
+                    scatter_list = [grad_mean for i in range(dist.get_world_size())]
+                else:
+                    scatter_list = None
+
+                avg_grad_received = torch.zeros_like(flatten_grad)
+                dist.scatter(avg_grad_received, scatter_list, src=0)
+
+                index = 0
+                for param in model.parameters():
+                    if param.requires_grad and (param.grad is not None):
+                        numel = param.grad.numel()
+                        param.grad.copy_(avg_grad_received[index:index + numel].view_as(param.grad))
+                        index += numel
                 torch.nn.utils.clip_grad_norm_(model.parameters(), args.max_grad_norm)
 
             tr_loss += loss.item()
             if (step + 1) % args.gradient_accumulation_steps == 0:
                 ##################################################
                 # TODO(cos568): perform a single optimization step (parameter update) by invoking the optimizer (expect one line of code)
-                
+                optimizer.step()
                 ##################################################
                 scheduler.step() # Update learning rate schedule
                 model.zero_grad()
@@ -155,7 +210,7 @@ def train(args, train_dataset, model, tokenizer):
         
         ##################################################
         # TODO(cos568): call evaluate() here to get the model performance after every epoch. (expect one line of code)
-
+        evaluate(args, model, tokenizer, prefix="")
         ##################################################
 
     return global_step, tr_loss / global_step
@@ -214,6 +269,8 @@ def evaluate(args, model, tokenizer, prefix=""):
             preds = np.squeeze(preds)
         result = compute_metrics(eval_task, preds, out_label_ids)
         results.update(result)
+        print(f"the result is:")
+        print(result)
 
         output_eval_file = os.path.join(eval_output_dir, "eval_results.txt")
         with open(output_eval_file, "w") as writer:
@@ -348,7 +405,25 @@ def main():
                              "See details at https://nvidia.github.io/apex/amp.html")
     parser.add_argument("--local_rank", type=int, default=-1,
                         help="For distributed training: local_rank. If single-node training, local_rank defaults to -1.")
+    parser.add_argument('--master_ip', type=str, default='127.0.0.1',
+                        help='IP address of the master node for distributed training')
+    parser.add_argument('--master_port', type=int, default=29500,
+                        help='Port used to communicate with master node')
+    parser.add_argument('--world_size', type=int, default=1,
+                        help='Total number of processes (nodes)')
     args = parser.parse_args()
+    
+    #### Initialize distributed training 
+    if args.local_rank != -1:
+        os.environ['MASTER_ADDR'] = args.master_ip
+        os.environ['MASTER_PORT'] = str(args.master_port)
+        dist.init_process_group(
+            backend="gloo",
+            init_method=f"tcp://{args.master_ip}:{args.master_port}",
+            world_size=args.world_size,
+            rank=args.local_rank,
+        )
+    ##################################################
 
     if os.path.exists(args.output_dir) and os.listdir(args.output_dir) and args.do_train and not args.overwrite_output_dir:
         raise ValueError("Output directory ({}) already exists and is not empty. Use --overwrite_output_dir to overcome.".format(args.output_dir))
@@ -356,6 +431,7 @@ def main():
     # set up (distributed) training
     args.device = torch.device("cuda" if torch.cuda.is_available() and not args.no_cuda else "cpu")
     args.n_gpu = torch.cuda.device_count()
+    print(f"[Rank {args.local_rank}] Starting training on {args.device}")
 
     # Setup logging
     logging.basicConfig(format = '%(asctime)s - %(levelname)s - %(name)s -   %(message)s',
@@ -384,11 +460,11 @@ def main():
     config_class, model_class, tokenizer_class = MODEL_CLASSES[args.model_type]
     config = config_class.from_pretrained(args.config_name if args.config_name else args.model_name_or_path, num_labels=num_labels, finetuning_task=args.task_name)
     tokenizer = tokenizer_class.from_pretrained(args.tokenizer_name if args.tokenizer_name else args.model_name_or_path, do_lower_case=args.do_lower_case)
-    
+
     ##################################################
     # TODO(cos568): load the model using from_pretrained. Remember to pass in `config` as an argument.
     # If you pass in args.model_name_or_path (e.g. "bert-base-cased"), the model weights file will be downloaded from HuggingFace. (expect one line of code)
-
+    model = model_class.from_pretrained(args.model_name_or_path, config=config)
     ##################################################
 
     if args.local_rank == 0:
