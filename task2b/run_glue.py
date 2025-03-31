@@ -16,7 +16,8 @@
 """ Finetuning the library models for sequence classification on GLUE (Bert, XLM, XLNet, RoBERTa)."""
 
 from __future__ import absolute_import, division, print_function
-
+import matplotlib.pyplot as plt
+import time
 import argparse
 import glob
 import logging
@@ -70,7 +71,9 @@ def set_seed(args):
 
 def train(args, train_dataset, model, tokenizer):
     """ Train the model """
-
+    # We will time each training iteration (step) within the single epoch
+    iteration_times = []
+    
     args.train_batch_size = args.per_device_train_batch_size
     train_sampler = RandomSampler(train_dataset)
     train_dataloader = DataLoader(train_dataset, sampler=train_sampler, batch_size=args.train_batch_size)
@@ -106,6 +109,7 @@ def train(args, train_dataset, model, tokenizer):
     logger.info("  Gradient Accumulation steps = %d", args.gradient_accumulation_steps)
     logger.info("  Total optimization steps = %d", t_total)
 
+    step_losses = []
     global_step = 0
     tr_loss, logging_loss = 0.0, 0.0
     model.zero_grad()
@@ -114,6 +118,7 @@ def train(args, train_dataset, model, tokenizer):
     for _ in train_iterator:
         epoch_iterator = tqdm(train_dataloader, desc="Iteration", disable=args.local_rank not in [-1, 0])
         for step, batch in enumerate(epoch_iterator):
+            step_start = time.time()
             model.train()
             batch = tuple(t.to(args.device) for t in batch)
             inputs = {'input_ids':      batch[0],
@@ -129,27 +134,6 @@ def train(args, train_dataset, model, tokenizer):
             if args.fp16:
                 with amp.scale_loss(loss, optimizer) as scaled_loss:
                     scaled_loss.backward()
-                # grad_list = []
-                # for param in model.parameters():
-                #     if (param.requires_grad) and (param.grad is not None):
-                #         grad_list.append(param.grad.view(-1))
-                # flatten_grad = torch.cat(grad_list)
-
-                # if dist.get_rank() == 0:
-                #     gather_list = [torch.zeros_like(flatten_grad) for i in range(dist.get_world_size())] 
-                # else:
-                #     gather_list = None
-                # dist.gather(flatten_grad, gather_list, dst=0)
-
-                # if dist.get_rank() == 0:
-                #     grad_mean = torch.stack(gather_list).mean(dim=0)
-                #     scatter_list = [grad_mean for i in range(dist.get_world_size())]
-                # else:
-                #     scatter_list = None
-
-                # avg_grad_received = torch.zeros_like(flatten_grad)
-                # dist.scatter(avg_grad_received, scatter_list, src=0)
-
                 index = 0
                 for param in model.parameters():
                     if param.requires_grad and (param.grad is not None):
@@ -192,6 +176,7 @@ def train(args, train_dataset, model, tokenizer):
                 torch.nn.utils.clip_grad_norm_(model.parameters(), args.max_grad_norm)
 
             tr_loss += loss.item()
+            step_losses.append((global_step, loss.item()))
             if (step + 1) % args.gradient_accumulation_steps == 0:
                 ##################################################
                 # TODO(cos568): perform a single optimization step (parameter update) by invoking the optimizer (expect one line of code)
@@ -201,6 +186,10 @@ def train(args, train_dataset, model, tokenizer):
                 model.zero_grad()
                 global_step += 1
 
+            # Record how long this iteration took
+            step_end = time.time()
+            iteration_times.append(step_end - step_start)
+            
             if args.max_steps > 0 and global_step > args.max_steps:
                 epoch_iterator.close()
                 break
@@ -213,6 +202,30 @@ def train(args, train_dataset, model, tokenizer):
         evaluate(args, model, tokenizer, prefix="")
         ##################################################
 
+    # Discard the first iteration's time
+    if len(iteration_times) > 1:
+        iteration_times = iteration_times[1:]
+    # Compute the average over the remaining iterations
+    if iteration_times:
+        avg_time = sum(iteration_times) / len(iteration_times)
+    else:
+        avg_time = 0.0
+    avg_loss = tr_loss / max(global_step, 1)
+    
+    print(f"[Rank {args.local_rank}] Avg iteration time (excluding first iteration): {avg_time:.4f} seconds")
+    print(f"[Rank {args.local_rank}] Average training loss: {avg_loss:.6f}")
+    plt.figure(figsize=(12, 8))
+    steps, step_loss_values = zip(*step_losses)
+    plt.plot(steps, step_loss_values, '-', linewidth=3, alpha=0.8)
+    plt.title(f'Training Loss: Node={args.local_rank}')
+    plt.xlabel('Global Steps')
+    plt.ylabel('Training Loss')
+    plt.grid(True)
+    plt.tight_layout()
+    step_loss_fig_path = os.path.join("/proj/cos568proj2-PG0/groups/jg9945/COS568-DistLM-SP25/task2a", f"task2a_loss_step_node={args.local_rank}.png")
+    plt.savefig(step_loss_fig_path)
+    print(f"Step loss figure saved to {step_loss_fig_path}")
+    
     return global_step, tr_loss / global_step
 
 
@@ -272,7 +285,7 @@ def evaluate(args, model, tokenizer, prefix=""):
         print(f"the result is:")
         print(result)
 
-        output_eval_file = os.path.join(eval_output_dir, "eval_results.txt")
+        output_eval_file = os.path.join("/proj/cos568proj2-PG0/groups/jg9945/COS568-DistLM-SP25/task2a", "eval_results.txt")
         with open(output_eval_file, "w") as writer:
             logger.info("***** Eval results {} *****".format(prefix))
             for key in sorted(result.keys()):

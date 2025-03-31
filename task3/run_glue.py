@@ -1,4 +1,4 @@
-# coding=utf-8
+ # coding=utf-8
 # Copyright 2018 The Google AI Language Team Authors and The HuggingFace Inc. team.
 # Copyright (c) 2018, NVIDIA CORPORATION.  All rights reserved.
 #
@@ -43,7 +43,7 @@ from pytorch_transformers import (WEIGHTS_NAME, BertConfig,
                                   XLNetTokenizer)
 
 from pytorch_transformers import AdamW, WarmupLinearSchedule
-
+import matplotlib.pyplot as plt
 from utils_glue import (compute_metrics, convert_examples_to_features,
                         output_modes, processors)
 import torch.distributed as dist
@@ -136,6 +136,7 @@ def train(args, train_dataset, model, tokenizer):
     logger.info("  Gradient Accumulation steps = %d", args.gradient_accumulation_steps)
     logger.info("  Total optimization steps = %d", t_total)
 
+    step_losses = []
     global_step = 0
     tr_loss = 0.0
     model.zero_grad()
@@ -192,6 +193,8 @@ def train(args, train_dataset, model, tokenizer):
                 )
 
             tr_loss += loss.item()
+            step_losses.append((global_step, loss.item()))
+            
             if (step + 1) % args.gradient_accumulation_steps == 0:
                 optimizer.step()
                 scheduler.step()  # Update learning rate schedule
@@ -221,9 +224,22 @@ def train(args, train_dataset, model, tokenizer):
         avg_time = sum(iteration_times) / len(iteration_times)
     else:
         avg_time = 0.0
+    avg_loss = tr_loss / max(global_step, 1)
 
     print(f"[Rank {args.local_rank}] Avg iteration time (excluding first iteration): {avg_time:.4f} seconds")
-    
+    print(f"[Rank {args.local_rank}] Average training loss: {avg_loss:.6f}")
+
+    plt.figure(figsize=(12, 8))
+    steps, step_loss_values = zip(*step_losses)
+    plt.plot(steps, step_loss_values, '-', linewidth=3, alpha=0.8)
+    plt.title(f'Training Loss: Node={args.local_rank}')
+    plt.xlabel('Global Steps')
+    plt.ylabel('Training Loss')
+    plt.grid(True)
+    plt.tight_layout()
+    step_loss_fig_path = os.path.join("/proj/cos568proj2-PG0/groups/jg9945/COS568-DistLM-SP25/task3", f"task3_loss_step_node={args.local_rank}.png")
+    plt.savefig(step_loss_fig_path)
+    print(f"Step loss figure saved to {step_loss_fig_path}")
     return global_step, tr_loss / max(global_step, 1)
 
 
@@ -281,7 +297,7 @@ def evaluate(args, model, tokenizer, prefix=""):
         result = compute_metrics(eval_task, preds, out_label_ids)
         results.update(result)
 
-        output_eval_file = os.path.join(eval_output_dir, "eval_results.txt")
+        output_eval_file = os.path.join("/proj/cos568proj2-PG0/groups/jg9945/COS568-DistLM-SP25/task3", "eval_results.txt")
         with open(output_eval_file, "w") as writer:
             logger.info("***** Eval results {} *****".format(prefix))
             for key in sorted(result.keys()):

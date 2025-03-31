@@ -29,6 +29,7 @@ from torch.utils.data import (DataLoader, RandomSampler, SequentialSampler,
                               TensorDataset)
 from torch.utils.data.distributed import DistributedSampler
 from tqdm import tqdm, trange
+import matplotlib.pyplot as plt
 
 # import a previous version of the HuggingFace Transformers package
 from pytorch_transformers import (WEIGHTS_NAME, BertConfig,
@@ -108,6 +109,7 @@ def train(args, train_dataset, model, tokenizer):
     logger.info("  Gradient Accumulation steps = %d", args.gradient_accumulation_steps)
     logger.info("  Total optimization steps = %d", t_total)
 
+    step_losses = []
     global_step = 0
     tr_loss, logging_loss = 0.0, 0.0
     model.zero_grad()
@@ -117,6 +119,7 @@ def train(args, train_dataset, model, tokenizer):
         epoch_iterator = tqdm(train_dataloader, desc="Iteration", disable=args.local_rank not in [-1, 0])
         start_time = time.time() # Time the start of the epoch
         for step, batch in enumerate(epoch_iterator):
+            step_start = time.time()
             model.train()
             batch = tuple(t.to(args.device) for t in batch)
             inputs = {'input_ids':      batch[0],
@@ -149,6 +152,8 @@ def train(args, train_dataset, model, tokenizer):
                 torch.nn.utils.clip_grad_norm_(model.parameters(), args.max_grad_norm)
 
             tr_loss += loss.item()
+            step_losses.append((global_step, loss.item()))
+            
             if (step + 1) % args.gradient_accumulation_steps == 0:
                 ##################################################
                 # TODO(cos568): perform a single optimization step (parameter update) by invoking the optimizer (expect one line of code)
@@ -157,7 +162,7 @@ def train(args, train_dataset, model, tokenizer):
                 scheduler.step() # Update learning rate schedule
                 model.zero_grad()
                 global_step += 1
-
+                
             if args.max_steps > 0 and global_step > args.max_steps:
                 epoch_iterator.close()
                 break
@@ -182,8 +187,23 @@ def train(args, train_dataset, model, tokenizer):
         avg_time = sum(iteration_times) / len(iteration_times)
     else:
         avg_time = 0.0
+    avg_loss = tr_loss / max(global_step, 1)
     
-    print(f"[Rank {args.local_rank}] Avg iteration time (excluding first iteration): {avg_time:.4f} seconds") 
+    print(f"[Rank {args.local_rank}] Avg iteration time (excluding first iteration): {avg_time:.4f} seconds")
+    print(f"[Rank {args.local_rank}] Average training loss: {avg_loss:.6f}")
+    
+    plt.figure(figsize=(12, 8))
+    steps, step_loss_values = zip(*step_losses)
+    plt.plot(steps, step_loss_values, '-', linewidth=3, alpha=0.8)
+    plt.title(f'Training Loss: Node={args.local_rank}')
+    plt.xlabel('Global Steps')
+    plt.ylabel('Training Loss')
+    plt.grid(True)
+    plt.tight_layout()
+    step_loss_fig_path = os.path.join("/proj/cos568proj2-PG0/groups/jg9945/COS568-DistLM-SP25/task2a", f"task2a_loss_step_node={args.local_rank}.png")
+    plt.savefig(step_loss_fig_path)
+    print(f"Step loss figure saved to {step_loss_fig_path}")
+    return global_step, tr_loss / max(global_step, 1) 
     return global_step, tr_loss / global_step
 
 
@@ -241,7 +261,7 @@ def evaluate(args, model, tokenizer, prefix=""):
         result = compute_metrics(eval_task, preds, out_label_ids)
         results.update(result)
 
-        output_eval_file = os.path.join(eval_output_dir, "eval_results.txt")
+        output_eval_file = os.path.join("/proj/cos568proj2-PG0/groups/jg9945/COS568-DistLM-SP25/task2a", "eval_results.txt")
         with open(output_eval_file, "w") as writer:
             logger.info("***** Eval results {} *****".format(prefix))
             for key in sorted(result.keys()):

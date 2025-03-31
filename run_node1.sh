@@ -1,7 +1,11 @@
 export GLUE_DIR=/proj/cos568proj2-PG0/glue_data
 export TASK_NAME=RTE
+export MASTER_ADDR=10.10.1.2    
+export MASTER_PORT=12345
+export RANK=1
+export WORLD_SIZE=4
 
-python3 task2a/run_glue.py \
+python3 task2b/run_glue.py \
   --model_type bert \
   --model_name_or_path bert-base-cased \
   --task_name $TASK_NAME \
@@ -14,7 +18,7 @@ python3 task2a/run_glue.py \
   --num_train_epochs 1 \
   --output_dir /tmp/$TASK_NAME/ \
   --overwrite_output_dir \
-  --master_ip c220g5-111207.wisc.cloudlab.us \
+  --master_ip 10.10.1.2 \
   --master_port 12345 \
   --world_size 4 \
   --local_rank 1
